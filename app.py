@@ -1,170 +1,180 @@
-import streamlit as st
 import os
+import streamlit as st
 import numpy as np
 import faiss
-from groq import Groq
-from pypdf import PdfReader
-from transformers import AutoTokenizer, AutoModel
 import torch
+from transformers import AutoTokenizer, AutoModel
+from groq import Groq
+import fitz  # PyMuPDF
 
-# =========================
-# Streamlit UI Setup
-# =========================
-st.set_page_config(page_title="Çevre Hukuku Danışma Asistanı", layout="wide")
 
-st.title("⚖️ Çevre Hukuku Danışma Hattı – RAG + Groq Demo")
-st.markdown("""
-Bu asistan, **Kıbrıs çevre mevzuatına** ilişkin sorularınızı,
-yüklenen **resmî PDF mevzuat dokümanlarından** yapay zekâ ile analiz ederek yanıtlar.
+# -------------------------------
+# 1. CONFIG
+# -------------------------------
+EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+GROQ_MODEL = "llama-3.1-70b-versatile"
 
-Model, **yalnızca belgedeki bilgilere dayanır**, hiçbir şekilde dış bilgi uydurmaz.  
-""")
+DOC_PATH = "documents/cevre_yasasi.pdf"
+CHUNKS_PATH = "vectorstore/chunks.npy"
+INDEX_PATH = "vectorstore/index.faiss"
 
-# =========================
-# Embedding Model (TURKISH)
-# =========================
+
+# -------------------------------
+# 2. EMBEDDING MODEL
+# -------------------------------
 @st.cache_resource
 def load_embedder():
-    model_name = "sabertazimi/turkish-stsb-xlm-r-multilingual"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL)
+    model = AutoModel.from_pretrained(EMBED_MODEL)
     return tokenizer, model
 
-tokenizer, model = load_embedder()
+
+tokenizer, embed_model = load_embedder()
+
 
 def embed_text(texts):
     tokens = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
 
     with torch.no_grad():
-        output = model(**tokens)
+        output = embed_model(**tokens)
         embeddings = output.last_hidden_state[:, 0]
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
 
     return embeddings.cpu().numpy().astype("float32")
 
 
-# =========================
-# PDF Loading & Chunking
-# =========================
-def load_pdf_text(path):
-    reader = PdfReader(path)
-    text = ""
-    for p in reader.pages:
-        t = p.extract_text()
-        if t:
-            text += t + "\n"
-    return text
+# -------------------------------
+# 3. PDF → Chunking
+# -------------------------------
+def load_pdf_chunks(pdf_path, chunk_size=700):
+    doc = fitz.open(pdf_path)
+    full_text = ""
 
+    for page in doc:
+        full_text += page.get_text()
 
-def chunk_text(text, chunk_size=700):
-    words = text.split()
+    # Split into chunks
     chunks = []
-    buf = []
+    words = full_text.split()
+    current = []
 
     for w in words:
-        buf.append(w)
-        if len(buf) >= chunk_size:
-            chunks.append(" ".join(buf))
-            buf = []
+        current.append(w)
+        if len(current) >= chunk_size:
+            chunks.append(" ".join(current))
+            current = []
 
-    if buf:
-        chunks.append(" ".join(buf))
+    if current:
+        chunks.append(" ".join(current))
 
     return chunks
 
 
-# =========================
-# Build or Load FAISS
-# =========================
-def build_or_load_index():
-    index_path = "vectorstore/index.faiss"
-    chunks_path = "vectorstore/chunks.npy"
+# -------------------------------
+# 4. FAISS Index Loader
+# -------------------------------
+def build_or_load_faiss():
+    if os.path.exists(CHUNKS_PATH) and os.path.exists(INDEX_PATH):
+        chunks = np.load(CHUNKS_PATH, allow_pickle=True)
+        index = faiss.read_index(INDEX_PATH)
+        return chunks, index
 
-    if os.path.exists(index_path) and os.path.exists(chunks_path):
-        index = faiss.read_index(index_path)
-        chunks = np.load(chunks_path, allow_pickle=True).tolist()
-        return index, chunks
+    st.warning("⚠️ FAISS index bulunamadı. Yeniden oluşturuluyor...")
 
-    pdf_path = "documents/cevre_yasasi.pdf"
-    text = load_pdf_text(pdf_path)
-    chunks = chunk_text(text)
+    chunks = load_pdf_chunks(DOC_PATH)
+    embeddings = []
 
-    embeddings = embed_text(chunks)
-    dim = embeddings.shape[1]
+    for c in st.progress_sequence(chunks, text="Embedding oluşturuluyor..."):
+        embeddings.append(embed_text([c])[0])
 
-    index = faiss.IndexFlatL2(dim)
+    embeddings = np.array(embeddings, dtype="float32")
+
+    index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
 
-    faiss.write_index(index, index_path)
-    np.save(chunks_path, np.array(chunks, dtype=object))
+    np.save(CHUNKS_PATH, np.array(chunks, dtype=object))
+    faiss.write_index(index, INDEX_PATH)
 
-    return index, chunks
-
-index, chunks = build_or_load_index()
+    return chunks, index
 
 
-# =========================
-# Search Function
-# =========================
-def search(query, index, chunks, k=4):
+chunks, index = build_or_load_faiss()
+
+
+# -------------------------------
+# 5. RETRIEVER
+# -------------------------------
+def retrieve(query, k=3):
     q_emb = embed_text([query])
-    scores, ids = index.search(q_emb, k)
-    return [chunks[i] for i in ids[0]]
+    scores, idx = index.search(q_emb, k)
+    return [chunks[i] for i in idx[0]]
 
 
-# =========================
-# Groq Answer Generation
-# =========================
-client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+# -------------------------------
+# 6. GROQ LLM CALL
+# -------------------------------
+groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
-def answer_with_groq(question, context):
-    prompt = f"""
+
+def lawyer_prompt(query, context):
+    return f"""
 Sen bir çevre hukuku uzmanı avukatsın.
 
 Kurallar:
-- Belgede yazmayan bir bilgi uydurma.
-- Her yanıtı **yalnızca verilen bağlamdaki** mevzuata dayandır.
-- Varsa **madde numaralarıyla referans ver**.
-- Metne dayanarak hukuki analiz yap.
-- Açık, anlaşılır ve profesyonel Türkçe kullan.
-- Bağlamda yoksa “Belgede bu konuda hüküm bulunmamaktadır” de.
+- Belgede yer almayan hiçbir bilgiyi uydurma.
+- Yorum yapman gerekirse “belgede yer alan bilgilere göre” diye başla.
+- Mevzuat maddelerine referans ver (varsa).
+- Açıklamayı anlaşılır ve profesyonel Türkçe hukuk diliyle yaz.
+- Metindeki ifadeleri sadık kalarak kullan.
 
---- BAĞLAM ---
+Soru:
+{query}
+
+İlgili mevzuat parçaları (bağlam):
 {context}
---- SONU ---
 
-SORU: {question}
-
-Profesyonel hukuki yanıt:
+Lütfen net ve maddeli şekilde açıkla.
 """
 
-    response = client.chat.completions.create(
-        model="llama3-70b-8192",
+
+def ask_groq(query, context_chunks):
+    context = "\n\n".join(context_chunks)
+    prompt = lawyer_prompt(query, context)
+
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
+        temperature=0.2
     )
 
-    return response.choices[0].message.content
+    return completion.choices[0].message["content"]
 
 
-# =========================
-# UI Input
-# =========================
-st.subheader("📨 Soru")
-query = st.text_input("Çevre mevzuatına ilişkin sorunuzu yazın:")
+# -------------------------------
+# 7. STREAMLIT UI
+# -------------------------------
+st.set_page_config(page_title="Çevre Hukuku RAG Demo", layout="wide")
 
-if st.button("Yanıtla"):
+st.title("⚖️ Çevre Hukuku Danışma Hattı – RAG + Groq Demo")
+
+st.write("""
+Bu demo, Kıbrıs çevre mevzuatına ilişkin sorular için **LLM + RAG** yaklaşımı kullanır.  
+Sorular PDF’teki gerçek metne göre yanıtlanır.
+""")
+
+query = st.text_input("Sorunuzu yazın:")
+
+if st.button("Sorgula"):
     if not query.strip():
-        st.error("Lütfen bir soru giriniz.")
+        st.error("Lütfen bir soru yazın.")
     else:
         with st.spinner("Yanıt hazırlanıyor..."):
-            retrieved = search(query, index, chunks)
-            context = "\n\n".join(retrieved)
-            answer = answer_with_groq(query, context)
+            context_chunks = retrieve(query)
+            answer = ask_groq(query, context_chunks)
 
-        st.subheader("📌 Yanıt")
-        st.write(answer)
+            st.subheader("📌 Yanıt")
+            st.write(answer)
 
-        with st.expander("🔍 Kullanılan Mevzuat Metni"):
-            st.write(context)
-
+            with st.expander("📄 Kullanılan Belgeler (RAG Çıktısı)"):
+                for c in context_chunks:
+                    st.write("— " + c[:500] + "...")
