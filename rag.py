@@ -1,93 +1,53 @@
-import faiss
 import os
+import faiss
 from pypdf import PdfReader
-import google.generativeai as genai
+from google import generativeai as genai
 import numpy as np
 from tqdm import tqdm
 
-# API Key yükle
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-
-def chunk_text(text, chunk_size=800, overlap=100):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
+EMBED_MODEL = "text-embedding-004"           # doğru yazım
+LLM_MODEL = "gemini-1.5-flash-8b"            # v1beta with 0.8.5 → çalışır
 
 
 class RAG:
     def __init__(self, pdf_path):
-        self.pdf_path = pdf_path
-        self.index_path = "vectorstore/index.faiss"
-        self.meta_path = "vectorstore/chunks.npy"
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-        os.makedirs("vectorstore", exist_ok=True)
+        self.embed_model = EMBED_MODEL
+        self.llm = genai.GenerativeModel(model_name=LLM_MODEL)
 
-        if not os.path.exists(self.index_path):
-            print("⚠️ FAISS index bulunamadı. Yeniden oluşturuluyor...")
-            self._build_index()
-        else:
-            print("ℹ️ FAISS index bulundu, yükleniyor...")
+        self.chunks = self._load_pdf_chunks(pdf_path)
+        self.index = self._build_faiss_index(self.chunks)
 
-        self.index = faiss.read_index(self.index_path)
-        self.chunks = np.load(self.meta_path, allow_pickle=True)
-        self.llm = genai.GenerativeModel("gemini-1.5-flash-latest")
+    def _load_pdf_chunks(self, path):
+        reader = PdfReader(path)
+        text = "\n".join([page.extract_text() for page in reader.pages])
+        chunks = text.split("\n\n")
+        return chunks
 
-    def _embed(self, text):
-        result = genai.embed_content(
-            model="text-embedding-004",
-            content=text
-        )
-        return np.array(result["embedding"]).astype("float32")
+    def _build_faiss_index(self, chunks):
+        vectors = []
+        for c in tqdm(chunks, desc="Embedding oluşturuluyor"):
+            emb = genai.embed_content(
+                model=self.embed_model,
+                content=c
+            )["embedding"]
+            vectors.append(emb)
 
-    def _build_index(self):
-        reader = PdfReader(self.pdf_path)
-        full_text = ""
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                full_text += extracted + "\n"
+        vectors = np.array(vectors).astype("float32")
+        dim = vectors.shape[1]
 
-        chunks = chunk_text(full_text)
+        index = faiss.IndexFlatL2(dim)
+        index.add(vectors)
+        return index
 
-        embeddings = []
-        for ch in tqdm(chunks, desc="Embedding oluşturuluyor"):
-            emb = self._embed(ch)
-            embeddings.append(emb)
+    def search(self, query, top_k=3):
+        q_emb = genai.embed_content(
+            model=self.embed_model,
+            content=query
+        )["embedding"]
 
-        embeddings = np.array(embeddings).astype("float32")
+        q_emb = np.array(q_emb).astype("float32").reshape(1, -1)
 
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
-
-        faiss.write_index(index, self.index_path)
-        np.save(self.meta_path, np.array(chunks, dtype=object))
-
-        print("✔ FAISS index oluşturuldu!")
-
-    def ask_lawyer(self, query):
-        q_emb = self._embed(query).reshape(1, -1)
-
-        D, I = self.index.search(q_emb, 3)
-        retrieved = "\n".join(self.chunks[i] for i in I[0])
-
-        prompt = f"""
-Sen Kıbrıs çevre mevzuatında uzman bir hukuk danışmanısın.
-
-Aşağıdaki mevzuat bölümlerine dayanarak soruyu yanıtla.
-
-Mevzuat:
-{retrieved}
-
-Soru:
-{query}
-
-Cevap:
-"""
-
-        answer = self.llm.generate_content(prompt)
-        return answer.text
+        scores, idx = self.index.search(q_em_
