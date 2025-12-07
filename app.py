@@ -1,15 +1,16 @@
 import streamlit as st
-from groq import Groq
-import faiss
+import os
 import numpy as np
+import faiss
+from groq import Groq
 from pypdf import PdfReader
 from transformers import AutoTokenizer, AutoModel
 import torch
 
 
-# ---------------------------
-# Load embedding model
-# ---------------------------
+# =========================
+# 1) Load embedding model
+# =========================
 @st.cache_resource
 def load_embedder():
     model_name = "BAAI/bge-small-en"
@@ -17,17 +18,12 @@ def load_embedder():
     model = AutoModel.from_pretrained(model_name)
     return tokenizer, model
 
+
 tokenizer, model = load_embedder()
 
 
 def embed_text(texts):
-    """Embeds list of texts using bge-small-en"""
-    tokens = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        return_tensors="pt"
-    )
+    tokens = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
 
     with torch.no_grad():
         output = model(**tokens)
@@ -37,24 +33,20 @@ def embed_text(texts):
     return embeddings.cpu().numpy().astype("float32")
 
 
-# ---------------------------
-# Groq client
-# ---------------------------
-client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-
-
-# ---------------------------
-# PDF Functions
-# ---------------------------
-def load_pdf_text(pdf_file):
-    reader = PdfReader(pdf_file)
+# =========================
+# 2) Load PDF & chunking
+# =========================
+def load_pdf_text(path):
+    reader = PdfReader(path)
     text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
+    for p in reader.pages:
+        t = p.extract_text()
+        if t:
+            text += t + "\n"
     return text
 
 
-def split_text(text, chunk_size=800):
+def chunk_text(text, chunk_size=800):
     words = text.split()
     chunks = []
     buf = []
@@ -71,76 +63,101 @@ def split_text(text, chunk_size=800):
     return chunks
 
 
-def build_index(chunks):
+# =========================
+# 3) Build / load FAISS
+# =========================
+def build_or_load_index():
+    index_path = "vectorstore/index.faiss"
+    chunks_path = "vectorstore/chunks.npy"
+
+    # if both exist → load
+    if os.path.exists(index_path) and os.path.exists(chunks_path):
+        st.success("FAISS index bulundu — yükleniyor...")
+
+        index = faiss.read_index(index_path)
+        chunks = np.load(chunks_path, allow_pickle=True).tolist()
+        return index, chunks
+
+    # else → rebuild
+    st.warning("⚠️ FAISS index bulunamadı. Yeniden oluşturuluyor...")
+
+    pdf_path = "documents/cevre_yasasi.pdf"
+    text = load_pdf_text(pdf_path)
+    chunks = chunk_text(text)
+
     embeddings = embed_text(chunks)
     dim = embeddings.shape[1]
 
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
 
-    return index
+    # save vectorstore
+    faiss.write_index(index, index_path)
+    np.save(chunks_path, np.array(chunks, dtype=object))
+
+    st.success("✅ Yeni FAISS index oluşturuldu.")
+    return index, chunks
 
 
-def search(query, index, chunks, top_k=3):
-    q = embed_text([query])
-    distances, ids = index.search(q, top_k)
+index, chunks = build_or_load_index()
+
+
+# =========================
+# 4) Retrieval
+# =========================
+def search(query, index, chunks, k=3):
+    q_emb = embed_text([query])
+    scores, ids = index.search(q_emb, k)
     return [chunks[i] for i in ids[0]]
 
 
-def groq_answer(question, context):
+# =========================
+# 5) Groq LLM answer
+# =========================
+client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+
+def answer_with_groq(question, context):
     prompt = f"""
-You are an assistant. Use ONLY the following context:
+Sen bir çevre hukuku asistanısın.
+Sadece aşağıdaki bağlamdan alıntılar yaparak cevap ver:
 
+--- BAĞLAM ---
 {context}
+--- SONU ---
 
-Question: {question}
+SORU: {question}
 
-Answer:
+Cevap:
 """
 
-    res = client.chat.completions.create(
+    response = client.chat.completions.create(
         model="llama3-70b-8192",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
+        temperature=0.2,
     )
-    return res.choices[0].message.content
+
+    return response.choices[0].message.content
 
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.title("📘 Groq RAG (FAISS + Transformers) – GitHub Version")
-st.write("Upload a PDF and query with Groq RAG")
+# =========================
+# 6) Streamlit UI
+# =========================
+st.title("⚖️ Çevre Hukuku Danışma – Groq RAG Demo")
 
-pdf = st.file_uploader("Upload PDF", type=["pdf"])
+query = st.text_input("Bir soru yazın (örn: 'ÇED nedir?')")
 
-if pdf:
-    text = load_pdf_text(pdf)
-    chunks = split_text(text)
-    index = build_index(chunks)
-
-    st.session_state.chunks = chunks
-    st.session_state.index = index
-
-    st.success("PDF processed. Ask your question!")
-
-
-question = st.text_input("Your question:")
-
-if st.button("Answer"):
-    if "index" not in st.session_state:
-        st.error("Upload a PDF first.")
+if st.button("Sorgula"):
+    if not query.strip():
+        st.error("Lütfen bir soru giriniz.")
     else:
-        retrieved = search(
-            question,
-            st.session_state.index,
-            st.session_state.chunks
-        )
-        context = "\n\n".join(retrieved)
-        answer = groq_answer(question, context)
+        with st.spinner("Yanıt hazırlanıyor..."):
+            retrieved = search(query, index, chunks)
+            context = "\n\n".join(retrieved)
+            answer = answer_with_groq(query, context)
 
-        st.subheader("Answer")
+        st.subheader("📌 Yanıt")
         st.write(answer)
 
-        with st.expander("Retrieved Context"):
+        with st.expander("🔍 Kullanılan Bağlam"):
             st.write(context)
