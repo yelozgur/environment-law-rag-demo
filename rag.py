@@ -6,7 +6,7 @@ import numpy as np
 from tqdm import tqdm
 
 EMBED_MODEL = "text-embedding-004"
-LLM_MODEL = "gemini-1.5-flash-8b"
+LLM_MODEL = "gemini-1.5-flash"   # ✅ Streamlit Cloud ile uyumlu
 
 
 class RAG:
@@ -14,7 +14,7 @@ class RAG:
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
         self.embed_model = EMBED_MODEL
-        self.llm = genai.GenerativeModel(model_name=LLM_MODEL)
+        self.llm = genai.GenerativeModel(LLM_MODEL)
 
         self.chunks = self._load_pdf_chunks(pdf_path)
         self.index = self._build_faiss_index(self.chunks)
