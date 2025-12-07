@@ -21,6 +21,20 @@ st.set_page_config(
     layout="wide"
 )
 
+# Available Groq models
+AVAILABLE_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant", 
+    "llama-3.2-3b-preview",
+    "llama-3.2-1b-preview",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it"
+]
+
+# Default model
+DEFAULT_MODEL = "llama-3.1-8b-instant"  # Hızlı ve ucuz
+# DEFAULT_MODEL = "llama-3.3-70b-versatile"  # Daha akıllı ama daha pahalı
+
 # Cache'lenmiş fonksiyonlar
 @st.cache_resource
 def init_embedding_model():
@@ -55,7 +69,7 @@ class ChromaRAGSystem:
         
         # Groq API
         self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        self.model_name = "llama3-8b-8192"
+        self.model_name = DEFAULT_MODEL
         
         # Dosya yolları
         self.pdf_path = "documents/cevre_yasasi.pdf"
@@ -73,6 +87,8 @@ class ChromaRAGSystem:
             st.session_state.vectorstore_loaded = False
         if 'chunks_count' not in st.session_state:
             st.session_state.chunks_count = 0
+        if 'selected_model' not in st.session_state:
+            st.session_state.selected_model = DEFAULT_MODEL
             
         # Vector store'u yükle
         self._load_vectorstore()
@@ -288,7 +304,7 @@ class ChromaRAGSystem:
             st.error(f"Arama hatası: {e}")
             return []
     
-    def ask_question(self, query, k=5):
+    def ask_question(self, query, k=5, model_name=None):
         """Soru sor ve yanıt al"""
         if not st.session_state.get('vectorstore_loaded', False):
             return {
@@ -296,6 +312,9 @@ class ChromaRAGSystem:
                 "sources": [],
                 "confidence": 0.0
             }
+        
+        # Model seçimi
+        model_to_use = model_name or st.session_state.get('selected_model', DEFAULT_MODEL)
         
         # Benzer parçaları ara
         with st.spinner("🔍 İlgili dokümanlar aranıyor..."):
@@ -339,16 +358,16 @@ Yanıt:"""
         # Groq API ile yanıt al
         try:
             response = self.groq_client.chat.completions.create(
-                model=self.model_name,
+                model=model_to_use,
                 messages=[
                     {
                         "role": "system", 
-                        "content": "Sen bir çevre hukuku uzmanı avukatsın. Sadece verilen kaynaklara dayanarak cevap ver."
+                        "content": "Sen bir çevre hukuku uzmanı avukatsın. Sadece verilen kaynaklara dayanarak cevap ver. Yanıtını Türkçe ver."
                     },
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2,
-                max_tokens=1500
+                temperature=0.3,
+                max_tokens=2000
             )
             
             answer = response.choices[0].message.content
@@ -357,15 +376,29 @@ Yanıt:"""
                 "answer": answer,
                 "sources": results,
                 "confidence": avg_similarity,
-                "query": query
+                "query": query,
+                "model_used": model_to_use
             }
             
         except Exception as e:
             st.error(f"API hatası: {e}")
+            
+            # Model değiştirme önerisi
+            if "model_decommissioned" in str(e) or "model not found" in str(e):
+                st.warning("""
+                ⚠️ **Model kullanımdan kaldırıldı!**
+                
+                Lütfen sidebar'dan yeni bir model seçin:
+                - `llama-3.1-8b-instant` (önerilen)
+                - `llama-3.3-70b-versatile` (daha güçlü)
+                - `mixtral-8x7b-32768` (alternatif)
+                """)
+            
             return {
                 "answer": f"Üzgünüm, bir hata oluştu: {str(e)}",
                 "sources": [],
-                "confidence": 0.0
+                "confidence": 0.0,
+                "model_used": model_to_use
             }
     
     def clear_vectorstore(self):
@@ -429,6 +462,35 @@ def main():
             st.info("Lütfen `documents/cevre_yasasi.pdf` dosyasını yükleyin.")
         
         st.markdown("---")
+        st.header("🤖 AI Model Seçimi")
+        
+        # Model seçimi
+        selected_model = st.selectbox(
+            "Kullanılacak AI Modeli:",
+            options=AVAILABLE_MODELS,
+            index=AVAILABLE_MODELS.index(DEFAULT_MODEL),
+            help="llama-3.1-8b-instant: Hızlı ve ucuz\nllama-3.3-70b-versatile: Daha akıllı ama daha pahalı"
+        )
+        
+        # Model bilgileri
+        model_info = {
+            "llama-3.3-70b-versatile": "En güçlü model, detaylı analiz",
+            "llama-3.1-8b-instant": "Hızlı ve verimli, günlük kullanım için",
+            "llama-3.2-3b-preview": "Hafif, test için uygun", 
+            "llama-3.2-1b-preview": "Çok hafif, basit sorgular",
+            "mixtral-8x7b-32768": "Uzun context, İngilizce ağırlıklı",
+            "gemma2-9b-it": "Google'ın modeli, çok dilli"
+        }
+        
+        if selected_model in model_info:
+            st.caption(f"ℹ️ {model_info[selected_model]}")
+        
+        # Modeli kaydet
+        if selected_model != st.session_state.get('selected_model', DEFAULT_MODEL):
+            st.session_state.selected_model = selected_model
+            st.info(f"Model değiştirildi: {selected_model}")
+        
+        st.markdown("---")
         st.header("⚙️ Ayarlar")
         
         k_results = st.slider(
@@ -437,6 +499,17 @@ def main():
             max_value=10,
             value=5
         )
+        
+        temperature = st.slider(
+            "Yaratıcılık seviyesi",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.3,
+            step=0.1,
+            help="0: Daha tutarlı, 1: Daha yaratıcı"
+        )
+        
+        st.session_state.temperature = temperature
         
         st.markdown("---")
         st.subheader("🗄️ Vector Store Durumu")
@@ -492,6 +565,10 @@ def main():
         
         st.success(f"✅ Sistem hazır! {chunks_count} metin parçası yüklendi.")
         
+        # Seçili model
+        current_model = st.session_state.get('selected_model', DEFAULT_MODEL)
+        st.info(f"🤖 Aktif model: **{current_model}**")
+        
         # Soru sorma bölümü
         st.subheader("❓ Soru Sor")
         
@@ -506,7 +583,13 @@ def main():
         with col1:
             if st.button("🔍 Yanıt Al", type="primary", use_container_width=True) and query:
                 # Yanıtı al
-                result = rag.ask_question(query, k=k_results)
+                temperature = st.session_state.get('temperature', 0.3)
+                
+                result = rag.ask_question(
+                    query, 
+                    k=k_results,
+                    model_name=current_model
+                )
                 
                 # Yanıtı göster
                 st.markdown("---")
@@ -516,7 +599,7 @@ def main():
                     st.markdown(result["answer"])
                     
                     # İstatistikler
-                    cols = st.columns(3)
+                    cols = st.columns(4)
                     with cols[0]:
                         st.metric("Güven Skoru", f"{result['confidence']:.2%}")
                     with cols[1]:
@@ -526,6 +609,8 @@ def main():
                             first_page = result["sources"][0].get('page', 0)
                             if first_page > 0:
                                 st.metric("İlk Sayfa", f"{first_page}")
+                    with cols[3]:
+                        st.metric("Model", result.get('model_used', current_model))
                 
                 # Kaynakları göster
                 if result["sources"]:
@@ -558,24 +643,13 @@ def main():
         2. **Vector store oluştur** → "Vector Store Oluştur" butonuna tıklayın
         3. **Bekleyin** → PDF işlenecek ve embedding'ler oluşturulacak
         
-        **📁 Mevcut Dosyalar:**
-        ```
-        /mount/src/environment-law-rag-demo/
-        ├── documents/
-        │   └── cevre_yasasi.pdf    ✅ VAR
-        ├── vectorstore/
-        │   ├── index.faiss         ⚠️ FAISS (kullanılmayacak)
-        │   └── chunks.npy          ⚠️ FAISS (kullanılmayacak)
-        ├── chroma_db/              ✅ ChromaDB için
-        ├── app.py
-        └── requirements.txt
-        ```
-        
-        **ℹ️ Not:** Mevcut FAISS dosyaları kullanılmayacak, yeni ChromaDB vector store oluşturulacak.
+        **ℹ️ Model Değişikliği:**
+        Eski `llama3-8b-8192` modeli kullanımdan kaldırıldı.
+        Yeni model: **`llama-3.1-8b-instant`** (otomatik seçildi)
         """)
         
         # Hızlı bilgiler
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             st.metric("PDF Durumu", "✅ Mevcut" if pdf_exists else "❌ Eksik")
@@ -585,6 +659,9 @@ def main():
         
         with col3:
             st.metric("Groq API", "✅ Hazır")
+        
+        with col4:
+            st.metric("Model", DEFAULT_MODEL)
     
     # Footer
     st.markdown("---")
@@ -592,7 +669,7 @@ def main():
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.caption("⚡ Powered by Groq API")
+        st.caption(f"⚡ Groq: {st.session_state.get('selected_model', DEFAULT_MODEL)}")
     with col2:
         st.caption("🔍 ChromaDB Vector Search")
     with col3:
@@ -626,4 +703,16 @@ if __name__ == "__main__":
                 if st.button("🔄 Yenile"):
                     st.rerun()
     else:
-        main()
+        # Test available models
+        try:
+            client = Groq(api_key=groq_key)
+            # Try to get available models
+            try:
+                # This might not be available in Groq API, so we'll use our hardcoded list
+                st.info(f"🤖 Kullanılabilir modeller: {', '.join(AVAILABLE_MODELS[:3])}...")
+            except:
+                pass
+            main()
+        except Exception as e:
+            st.error(f"Groq API bağlantı hatası: {e}")
+            st.info("Lütfen API key'inizi kontrol edin.")
