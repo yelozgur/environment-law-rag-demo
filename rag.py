@@ -1,64 +1,91 @@
 import faiss
-import numpy as np
+import os
 from pypdf import PdfReader
-import google.generativeai as genai
-import streamlit as st
+from google.generativeai import configure, GenerativeModel
+import numpy as np
+from tqdm import tqdm
 
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-def load_pdf(path):
-    reader = PdfReader(path)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() or ""
-    return text
 
-def split_text(text, chunk_size=1500, overlap=100):
+def chunk_text(text, chunk_size=800, overlap=100):
     chunks = []
     start = 0
     while start < len(text):
-        end = min(start + chunk_size, len(text))
+        end = start + chunk_size
         chunks.append(text[start:end])
-    start = end - overlap
+        start += chunk_size - overlap
     return chunks
 
-def embed(text):
-    res = genai.embed_content(
-        model="models/text-embedding-004",
-        content=text
-    )
-    return np.array(res["embedding"], dtype="float32")
 
 class RAG:
     def __init__(self, pdf_path):
-        self.text = load_pdf(pdf_path)
-        self.chunks = split_text(self.text)
+        self.pdf_path = pdf_path
+        self.index_path = "vectorstore/index.faiss"
+        self.meta_path = "vectorstore/chunks.npy"
 
-        vectors = [embed(ch) for ch in self.chunks]
-        self.vectors = np.vstack(vectors)
+        os.makedirs("vectorstore", exist_ok=True)
 
-        self.index = faiss.IndexFlatL2(self.vectors.shape[1])
-        self.index.add(self.vectors)
+        if not os.path.exists(self.index_path):
+            print("⚠️ FAISS index bulunamadı. Yeniden oluşturuluyor...")
+            self._build_index()
+        else:
+            print("ℹ️ FAISS index bulundu, yükleniyor...")
 
-    def search(self, query, k=5):
-        q_vec = embed(query).reshape(1, -1)
-        _, idx = self.index.search(q_vec, k)
-        return [self.chunks[i] for i in idx[0]]
+        self.index = faiss.read_index(self.index_path)
+        self.chunks = np.load(self.meta_path, allow_pickle=True)
+        self.model = GenerativeModel("gemini-1.5-flash")
+
+    def _build_index(self):
+        reader = PdfReader(self.pdf_path)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() + "\n"
+
+        chunks = chunk_text(full_text)
+
+        # Embeddings üret
+        model = GenerativeModel("text-embedding-004")
+        embeddings = []
+        for ch in tqdm(chunks, desc="Embedding oluşturuluyor"):
+            emb = model.embed_content(
+                content=ch,
+                model="text-embedding-004"
+            )["embedding"]
+            embeddings.append(emb)
+
+        embeddings = np.array(embeddings).astype("float32")
+
+        # FAISS index oluştur
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+
+        faiss.write_index(index, self.index_path)
+        np.save(self.meta_path, np.array(chunks, dtype=object))
+
+        print("✔ FAISS index oluşturuldu!")
 
     def ask_lawyer(self, query):
-        context = "\n\n".join(self.search(query))
+        model = GenerativeModel("text-embedding-004")
+        q_emb = model.embed_content(content=query)["embedding"]
+        q_emb = np.array(q_emb).astype("float32").reshape(1, -1)
 
-        system_prompt = """
-Sen bir çevre hukuku uzmanı avukatsın.
+        D, I = self.index.search(q_emb, 3)
+        retrieved = "\n".join(self.chunks[i] for i in I[0])
 
-Kurallar:
-- Belgede yazmayan bir bilgi uydurma
-- Maddelere referans ver (varsa)
-- Metne dayanarak açıklama yap
-- Anlaşılır, profesyonel hukuki Türkçe kullan
+        prompt = f"""
+Sen Kıbrıs'ın çevre mevzuatında uzman bir hukuk danışmanısın.
+Aşağıdaki mevzuat parçalarına dayanarak profesyonel bir yanıt ver.
+
+Mevzuat:
+{retrieved}
+
+Soru:
+{query}
+
+Cevap (hukuki, açıklayıcı):
 """
 
-        full_prompt = f"{system_prompt}\n\nSORU: {query}\n\nKAYNAK METİN:\n{context}"
-
-        response = genai.GenerativeModel("gemini-2.0-flash").generate_content(full_prompt)
+        lawyer_model = GenerativeModel("gemini-1.5-flash")
+        response = lawyer_model.generate_content(prompt)
         return response.text
