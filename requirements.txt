@@ -1,5 +1,5 @@
 streamlit
 faiss-cpu
 pypdf
-google-generativeai>=1.0.0
+google-generativeai==0.8.5
 numpy
