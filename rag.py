@@ -13,7 +13,7 @@ def load_pdf(path):
         text += page.extract_text() or ""
     return text
 
-def split_text(text, chunk_size=800, overlap=100):
+def split_text(text, chunk_size=1500, overlap=100):
     chunks = []
     start = 0
     while start < len(text):
