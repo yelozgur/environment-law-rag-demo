@@ -1,149 +1,114 @@
 import os
 import streamlit as st
-import fitz
-import numpy as np
-from pathlib import Path
 import json
 import time
-from groq import Groq
-from dotenv import load_dotenv
-import chromadb
-from chromadb.utils import embedding_functions
+from pathlib import Path
 
-# Load environment
-load_dotenv()
-
-# Page config
-st.set_page_config(page_title="Çevre Hukuku", layout="wide")
-
-# Initialize
-@st.cache_resource
-def init_system():
-    # Create directories
-    Path("documents").mkdir(exist_ok=True)
-    Path("vectorstore").mkdir(exist_ok=True)
-    
-    # Initialize ChromaDB
-    client = chromadb.PersistentClient(path="./chroma_db")
-    
-    # Get or create collection
-    try:
-        collection = client.get_or_create_collection(
-            name="cevre_hukuku",
-            embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-            )
-        )
-        return client, collection, True
-    except:
-        return client, None, False
+# Streamlit sayfa yapılandırması
+st.set_page_config(
+    page_title="Çevre Hukuku Debug",
+    page_icon="⚖️",
+    layout="wide"
+)
 
 def main():
-    st.title("⚖️ Çevre Hukuku")
+    st.title("🔍 Dosya Sistemi Kontrolü")
+    st.markdown("---")
     
-    # Initialize
-    client, collection, has_collection = init_system()
+    # Mevcut çalışma dizini
+    current_dir = os.getcwd()
+    st.subheader("Mevcut Dizin")
+    st.code(current_dir)
     
-    # Sidebar
-    with st.sidebar:
-        st.header("📂 PDF İşleme")
+    # Tüm dosya ve klasörleri listele
+    st.subheader("Dosya Yapısı")
+    
+    def list_files(startpath):
+        for root, dirs, files in os.walk(startpath):
+            level = root.replace(startpath, '').count(os.sep)
+            indent = ' ' * 4 * level
+            st.text(f'{indent}{os.path.basename(root)}/')
+            subindent = ' ' * 4 * (level + 1)
+            for file in files:
+                st.text(f'{subindent}{file}')
+    
+    list_files(current_dir)
+    
+    # Önemli dosyaları kontrol et
+    st.markdown("---")
+    st.subheader("📁 Önemli Dosya Kontrolleri")
+    
+    important_paths = [
+        ("documents/", "documents/"),
+        ("documents/cevre_yasasi.pdf", "PDF dosyası"),
+        ("vectorstore/", "vectorstore/"),
+        ("vectorstore/metadata.json", "metadata"),
+        ("requirements.txt", "requirements.txt"),
+        (".streamlit/", ".streamlit klasörü"),
+        (".streamlit/secrets.toml", "secrets.toml"),
+    ]
+    
+    for path, description in important_paths:
+        exists = os.path.exists(path)
+        status = "✅ VAR" if exists else "❌ YOK"
         
-        # Check PDF
-        pdf_path = "documents/cevre_yasasi.pdf"
-        has_pdf = os.path.exists(pdf_path)
-        
-        if has_pdf:
-            size = os.path.getsize(pdf_path) / 1024 / 1024
-            st.success(f"PDF: {size:.1f}MB")
-            
-            if st.button("🔄 Vector Store Oluştur"):
-                with st.spinner("PDF işleniyor..."):
-                    try:
-                        # Extract text
-                        doc = fitz.open(pdf_path)
-                        texts = []
-                        metadatas = []
-                        
-                        for page_num in range(len(doc)):
-                            page = doc.load_page(page_num)
-                            text = page.get_text().strip()
-                            if text:
-                                texts.append(text)
-                                metadatas.append({"page": page_num + 1})
-                        
-                        doc.close()
-                        
-                        if texts:
-                            # Create collection
-                            collection = client.create_collection(
-                                name="cevre_hukuku",
-                                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-                                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-                                )
-                            )
-                            
-                            # Add to collection
-                            ids = [f"page_{i+1}" for i in range(len(texts))]
-                            collection.add(
-                                documents=texts,
-                                metadatas=metadatas,
-                                ids=ids
-                            )
-                            
-                            # Save metadata
-                            metadata = {
-                                "source": pdf_path,
-                                "pages": len(texts),
-                                "created": time.time()
-                            }
-                            with open("vectorstore/metadata.json", "w") as f:
-                                json.dump(metadata, f)
-                            
-                            st.success(f"{len(texts)} sayfa eklendi!")
-                            st.rerun()
-                        
-                    except Exception as e:
-                        st.error(f"Hata: {e}")
+        if exists:
+            if os.path.isfile(path):
+                size = os.path.getsize(path)
+                st.success(f"{status} - {description}: {path} ({size} bytes)")
+            else:
+                st.success(f"{status} - {description}: {path} (klasör)")
         else:
-            st.error("PDF bulunamadı!")
+            st.error(f"{status} - {description}: {path}")
             
-            # Upload PDF
-            uploaded = st.file_uploader("PDF yükle", type=['pdf'])
-            if uploaded:
-                Path("documents").mkdir(exist_ok=True)
-                with open(pdf_path, "wb") as f:
-                    f.write(uploaded.getvalue())
-                st.success("PDF yüklendi! Sayfayı yenileyin.")
+            # Eğer PDF yoksa, oluşturmak için
+            if path == "documents/cevre_yasasi.pdf":
+                with st.expander("PDF oluşturma seçenekleri"):
+                    uploaded_file = st.file_uploader("PDF yükle", type=['pdf'])
+                    if uploaded_file is not None:
+                        Path("documents").mkdir(exist_ok=True)
+                        with open("documents/cevre_yasasi.pdf", "wb") as f:
+                            f.write(uploaded_file.getvalue())
+                        st.success("PDF yüklendi! Sayfayı yenileyin.")
     
-    # Main area
-    if has_collection:
-        st.subheader("❓ Soru Sor")
-        
-        query = st.text_input("Soru:")
-        
-        if query and st.button("Cevapla"):
-            try:
-                # Search
-                results = collection.query(
-                    query_texts=[query],
-                    n_results=3
-                )
-                
-                if results['documents']:
-                    # Show context
-                    with st.expander("📚 Bulunan Bilgiler"):
-                        for i, doc in enumerate(results['documents'][0]):
-                            st.write(f"**Sayfa {results['metadatas'][0][i]['page']}:**")
-                            st.write(doc[:500] + "...")
-                    
-                    # Get answer (simplified)
-                    st.subheader("🤖 Yanıt")
-                    st.info("Bu bir demo. Gerçek yanıt için Groq API gerekli.")
-                    
-            except Exception as e:
-                st.error(f"Hata: {e}")
+    # Environment variables kontrolü
+    st.markdown("---")
+    st.subheader("🔑 Environment Variables")
+    
+    env_vars = ["GROQ_API_KEY", "HF_TOKEN"]
+    for var in env_vars:
+        value = os.getenv(var)
+        if value:
+            st.success(f"✅ {var}: {'*' * min(8, len(value))}...")
+        else:
+            st.error(f"❌ {var}: AYARLANMAMIŞ")
+    
+    # Secrets dosyası kontrolü
+    st.markdown("---")
+    st.subheader("🗝️ Streamlit Secrets")
+    
+    secrets_path = ".streamlit/secrets.toml"
+    if os.path.exists(secrets_path):
+        with open(secrets_path, 'r') as f:
+            secrets_content = f.read()
+        st.success("✅ secrets.toml bulundu")
+        with st.expander("Secrets içeriği"):
+            st.code(secrets_content)
     else:
-        st.warning("Lütfen önce PDF yükleyin ve vector store oluşturun.")
+        st.error("❌ secrets.toml bulunamadı")
+        
+        # Secrets oluşturma formu
+        with st.form("create_secrets"):
+            st.info("Secrets dosyası oluştur")
+            groq_key = st.text_input("GROQ_API_KEY:", type="password")
+            hf_token = st.text_input("HF_TOKEN:", type="password")
+            
+            if st.form_submit_button("Secrets Oluştur"):
+                Path(".streamlit").mkdir(exist_ok=True)
+                secrets_content = f'GROQ_API_KEY = "{groq_key}"\nHF_TOKEN = "{hf_token}"'
+                with open(secrets_path, 'w') as f:
+                    f.write(secrets_content)
+                st.success("Secrets dosyası oluşturuldu! Sayfayı yenileyin.")
 
 if __name__ == "__main__":
     main()
