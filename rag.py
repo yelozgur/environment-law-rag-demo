@@ -5,9 +5,8 @@ from google import generativeai as genai
 import numpy as np
 from tqdm import tqdm
 
-
-EMBED_MODEL = "text-embedding-004"           # doğru yazım
-LLM_MODEL = "gemini-1.5-flash-8b"            # v1beta with 0.8.5 → çalışır
+EMBED_MODEL = "text-embedding-004"
+LLM_MODEL = "gemini-1.5-flash-8b"
 
 
 class RAG:
@@ -50,4 +49,25 @@ class RAG:
 
         q_emb = np.array(q_emb).astype("float32").reshape(1, -1)
 
-        scores, idx = self.index.search(q_em_
+        scores, idx = self.index.search(q_emb, top_k)
+        results = [self.chunks[i] for i in idx[0]]
+        return "\n\n".join(results)
+
+    def ask_lawyer(self, query):
+        context = self.search(query)
+
+        prompt = f"""
+Sen Kıbrıs çevre hukukunda uzman bir avukatsın.
+Aşağıdaki bağlamı kullanarak hukuki ve anlaşılır yanıt ver:
+
+Bağlam:
+{context}
+
+Soru:
+{query}
+
+Yanıt:
+"""
+
+        response = self.llm.generate_content(prompt)
+        return response.text
