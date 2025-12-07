@@ -1,73 +1,69 @@
-import os
 import faiss
-from pypdf import PdfReader
-from google import generativeai as genai
 import numpy as np
-from tqdm import tqdm
-
-EMBED_MODEL = "text-embedding-004"
-LLM_MODEL = "gemini-1.5-flash"   # ✅ Streamlit Cloud ile uyumlu
+from sentence_transformers import SentenceTransformer
+from google import genai
 
 
 class RAG:
-    def __init__(self, pdf_path):
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    def __init__(self, api_key, documents):
+        self.documents = documents
 
-        self.embed_model = EMBED_MODEL
-        self.llm = genai.GenerativeModel(LLM_MODEL)
+        # Embedding Model
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
 
-        self.chunks = self._load_pdf_chunks(pdf_path)
-        self.index = self._build_faiss_index(self.chunks)
+        # Encode docs
+        self.embeddings = self.model.encode(
+            [d["text"] for d in documents], convert_to_numpy=True
+        )
 
-    def _load_pdf_chunks(self, path):
-        reader = PdfReader(path)
-        text = "\n".join([page.extract_text() for page in reader.pages])
-        chunks = text.split("\n\n")
-        return chunks
+        # FAISS index
+        dim = self.embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dim)
+        self.index.add(self.embeddings)
 
-    def _build_faiss_index(self, chunks):
-        vectors = []
-        for c in tqdm(chunks, desc="Embedding oluşturuluyor"):
-            emb = genai.embed_content(
-                model=self.embed_model,
-                content=c
-            )["embedding"]
-            vectors.append(emb)
+        # Google client
+        self.client = genai.Client(api_key=api_key)
 
-        vectors = np.array(vectors).astype("float32")
-        dim = vectors.shape[1]
+    def search(self, query, k=5):
+        """Retrieve top-k docs"""
+        q_em = self.model.encode([query], convert_to_numpy=True)
 
-        index = faiss.IndexFlatL2(dim)
-        index.add(vectors)
-        return index
+        # FIX: previous error — parenthesis closed and variable name corrected
+        scores, idx = self.index.search(q_em, k)
 
-    def search(self, query, top_k=3):
-        q_emb = genai.embed_content(
-            model=self.embed_model,
-            content=query
-        )["embedding"]
+        results = []
+        for i in idx[0]:
+            results.append(self.documents[i])
 
-        q_emb = np.array(q_emb).astype("float32").reshape(1, -1)
+        return results
 
-        scores, idx = self.index.search(q_emb, top_k)
-        results = [self.chunks[i] for i in idx[0]]
-        return "\n\n".join(results)
+    def build_prompt(self, question, contexts):
+        context_block = "\n\n".join(
+            f"[{d['id']}] {d['text']}" for d in contexts
+        )
 
-    def ask_lawyer(self, query):
-        context = self.search(query)
+        return f"""
+You are an expert in Turkish environmental law.
+Use ONLY the information in the CONTEXT. 
+If information is missing, say "mevzuatta bunun karşılığı bulunmamaktadır".
 
-        prompt = f"""
-Sen Kıbrıs çevre hukukunda uzman bir avukatsın.
-Aşağıdaki bağlamı kullanarak hukuki ve anlaşılır yanıt ver:
+CONTEXT:
+{context_block}
 
-Bağlam:
-{context}
+QUESTION:
+{question}
 
-Soru:
-{query}
-
-Yanıt:
+ANSWER:
 """
 
-        response = self.llm.generate_content(prompt)
-        return response.text
+    def ask(self, question):
+        ctx = self.search(question)
+        prompt = self.build_prompt(question, ctx)
+
+        # FIX: correct model name
+        response = self.client.models.generate_content(
+            model="models/gemini-2.0-flash-exp",
+            contents=prompt
+        )
+
+        return response.text, ctx
