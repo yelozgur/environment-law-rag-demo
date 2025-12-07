@@ -3,13 +3,15 @@ import streamlit as st
 import numpy as np
 import fitz
 import requests
-from groq import Groq
-from dotenv import load_dotenv
-import faiss
+import json
 import tempfile
 import time
 from pathlib import Path
-import json
+from groq import Groq
+from dotenv import load_dotenv
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
 
 # Environment variables yükle
 load_dotenv()
@@ -21,99 +23,181 @@ st.set_page_config(
     layout="wide"
 )
 
-class StreamlitRAGSystem:
+# Cache'lenmiş fonksiyonlar
+@st.cache_resource
+def load_embedding_model():
+    """Hafif embedding modelini yükle"""
+    try:
+        # CPU dostu, küçük model
+        model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+        return model
+    except Exception as e:
+        st.error(f"Embedding model yüklenemedi: {e}")
+        return None
+
+@st.cache_resource
+def init_chroma_client():
+    """ChromaDB client'ını başlat"""
+    try:
+        # Streamlit Cloud için persist dizini
+        persist_dir = "./chroma_db"
+        Path(persist_dir).mkdir(exist_ok=True)
+        
+        client = chromadb.PersistentClient(
+            path=persist_dir,
+            settings=Settings(
+                chroma_db_impl="duckdb+parquet",
+                anonymized_telemetry=False
+            )
+        )
+        return client
+    except Exception as e:
+        st.error(f"ChromaDB başlatma hatası: {e}")
+        return None
+
+class ChromaRAGSystem:
     def __init__(self):
-        """RAG sistemini başlat"""
-        # API ayarları
-        self.HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/intfloat/multilingual-e5-small"
-        self.HF_TOKEN = os.getenv("HF_TOKEN")
-        self.HF_HEADERS = {"Authorization": f"Bearer {self.HF_TOKEN}"}
+        """ChromaDB tabanlı RAG sistemi"""
+        self.embedding_model = load_embedding_model()
+        self.chroma_client = init_chroma_client()
         
         # Groq API
         self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         self.model_name = "llama3-8b-8192"
         
+        # Koleksiyon adı
+        self.collection_name = "cevre_hukuku"
+        
         # Dosya yolları
         self.pdf_path = "documents/cevre_yasasi.pdf"
-        self.index_path = "vectorstore/index.faiss"
-        self.chunks_path = "vectorstore/chunks.npy"
         self.metadata_path = "vectorstore/metadata.json"
         
         # Klasörleri oluştur
         self._ensure_directories()
         
-        # Index yükle
-        self._load_index()
+        # Koleksiyonu yükle
+        self._load_collection()
     
     def _ensure_directories(self):
         """Gerekli klasörleri oluştur"""
         Path("documents").mkdir(exist_ok=True)
         Path("vectorstore").mkdir(exist_ok=True)
     
-    def _load_index(self):
-        """FAISS index ve chunk'ları yükle"""
+    def _load_collection(self):
+        """ChromaDB koleksiyonunu yükle veya oluştur"""
         try:
-            if os.path.exists(self.index_path) and os.path.exists(self.chunks_path):
-                with st.spinner("📦 FAISS index yükleniyor..."):
-                    self.index = faiss.read_index(self.index_path)
-                    self.chunks = np.load(self.chunks_path, allow_pickle=True)
-                    
-                    # Metadata yükle (varsa)
-                    if os.path.exists(self.metadata_path):
-                        with open(self.metadata_path, 'r', encoding='utf-8') as f:
-                            self.metadata = json.load(f)
-                    else:
-                        self.metadata = {"source": self.pdf_path, "chunks_count": len(self.chunks)}
-                    
+            if self.chroma_client is None:
+                st.error("ChromaDB client başlatılamadı!")
+                st.session_state.index_loaded = False
+                return
+            
+            # Koleksiyonları listele
+            collections = self.chroma_client.list_collections()
+            collection_names = [col.name for col in collections]
+            
+            if self.collection_name in collection_names:
+                self.collection = self.chroma_client.get_collection(self.collection_name)
+                count = self.collection.count()
                 st.session_state.index_loaded = True
-                st.session_state.chunks_count = len(self.chunks)
+                st.session_state.chunks_count = count
+                
+                # Metadata yükle
+                if os.path.exists(self.metadata_path):
+                    with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                        self.metadata = json.load(f)
+                else:
+                    self.metadata = {"source": self.pdf_path, "chunks_count": count}
+                
                 return True
             else:
                 st.session_state.index_loaded = False
                 return False
+                
         except Exception as e:
-            st.error(f"Index yükleme hatası: {e}")
+            st.warning(f"Koleksiyon yüklenemedi, yeni oluşturulacak: {e}")
             st.session_state.index_loaded = False
             return False
     
-    def _embed_text(self, text):
-        """Metin için embedding oluştur"""
-        max_retries = 3
+    def _create_collection(self):
+        """Yeni koleksiyon oluştur"""
+        try:
+            self.collection = self.chroma_client.create_collection(
+                name=self.collection_name,
+                metadata={"description": "Çevre Hukuku Dokümanları"}
+            )
+            return True
+        except Exception as e:
+            st.error(f"Koleksiyon oluşturma hatası: {e}")
+            return False
+    
+    def extract_text_from_pdf(self, pdf_path=None, pdf_file=None):
+        """PDF'den metin çıkar"""
+        chunks = []
+        page_chunk_map = []
         
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(
-                    self.HF_API_URL,
-                    headers=self.HF_HEADERS,
-                    json={"inputs": text},
-                    timeout=30
-                )
-                
-                if response.status_code == 200:
-                    embedding = np.array(response.json(), dtype=np.float32)
-                    
-                    # Embedding boyutunu kontrol et
-                    if embedding.ndim == 1:
-                        embedding = embedding.reshape(1, -1)
-                    
-                    return embedding
-                elif response.status_code == 503:  # Model loading
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        time.sleep(wait_time)
-                        continue
-                
-                response.raise_for_status()
-                
-            except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                else:
-                    st.error(f"Embedding oluşturma hatası: {e}")
-                    return None
+        try:
+            if pdf_file:
+                # Geçici dosya oluştur
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    tmp_file.write(pdf_file.getvalue())
+                    tmp_path = tmp_file.name
+                doc_path = tmp_path
+                is_temp = True
+            else:
+                doc_path = pdf_path or self.pdf_path
+                is_temp = False
+            
+            if not os.path.exists(doc_path):
+                st.error(f"PDF dosyası bulunamadı: {doc_path}")
+                return []
+            
+            # PDF'den metin çıkar
+            doc = fitz.open(doc_path)
+            
+            for page_num, page in enumerate(doc, 1):
+                text = page.get_text().strip()
+                if text:
+                    # Paragraflara böl
+                    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+                    for para in paragraphs:
+                        if 50 < len(para) < 2000:  # Boyut kontrolü
+                            chunks.append(para)
+                            page_chunk_map.append(page_num)
+            
+            doc.close()
+            
+            # Geçici dosyayı temizle
+            if is_temp:
+                os.unlink(doc_path)
+            
+            if chunks:
+                st.info(f"✅ {len(chunks)} metin parçası çıkarıldı")
+            else:
+                st.warning("PDF'den metin çıkarılamadı!")
+            
+            return chunks, page_chunk_map
+            
+        except Exception as e:
+            st.error(f"PDF işleme hatası: {e}")
+            return [], []
+    
+    def create_embeddings(self, texts):
+        """Metinler için embedding oluştur"""
+        if self.embedding_model is None:
+            st.error("Embedding model yüklenemedi!")
+            return None
         
-        return None
+        try:
+            embeddings = self.embedding_model.encode(
+                texts,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+            return embeddings
+        except Exception as e:
+            st.error(f"Embedding oluşturma hatası: {e}")
+            return None
     
     def create_index_from_existing_pdf(self):
         """Mevcut PDF'den index oluştur"""
@@ -121,215 +205,153 @@ class StreamlitRAGSystem:
             st.error(f"PDF dosyası bulunamadı: {self.pdf_path}")
             return False
         
-        try:
-            with st.spinner("📄 Mevcut PDF işleniyor..."):
-                # PDF'den metin çıkar
-                doc = fitz.open(self.pdf_path)
-                chunks = []
-                page_chunk_map = []
-                
-                for page_num, page in enumerate(doc, 1):
-                    text = page.get_text().strip()
-                    if text:
-                        # Sayfayı parçalara böl
-                        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-                        for para in paragraphs:
-                            if len(para) > 30:  # Çok kısa paragrafları atla
-                                chunks.append(para)
-                                page_chunk_map.append(page_num)
-                
-                doc.close()
-                
-                if not chunks:
-                    st.error("PDF'den metin çıkarılamadı!")
-                    return False
-                
-                st.info(f"✅ {len(chunks)} metin parçası çıkarıldı")
-            
-            # Embedding oluştur
-            with st.spinner("🔨 Embedding'ler oluşturuluyor..."):
-                embeddings = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                for i, chunk in enumerate(chunks):
-                    status_text.text(f"Parça {i+1}/{len(chunks)} işleniyor...")
-                    emb = self._embed_text(chunk)
-                    if emb is not None:
-                        embeddings.append(emb)
-                    
-                    # İlerleme çubuğunu güncelle
-                    progress_bar.progress((i + 1) / len(chunks))
-                
-                status_text.empty()
-                
-                if not embeddings:
-                    st.error("Embedding oluşturulamadı!")
-                    return False
-                
-                embeddings_array = np.vstack(embeddings)
-            
-            # FAISS index oluştur
-            with st.spinner("🏗️ FAISS index oluşturuluyor..."):
-                dim = embeddings_array.shape[1]
-                index = faiss.IndexFlatL2(dim)
-                index.add(embeddings_array)
-                
-                # Kaydet
-                faiss.write_index(index, self.index_path)
-                np.save(self.chunks_path, np.array(chunks, dtype=object))
-                
-                # Metadata kaydet
-                metadata = {
-                    "source": self.pdf_path,
-                    "chunks_count": len(chunks),
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "page_chunk_map": page_chunk_map
-                }
-                
-                with open(self.metadata_path, 'w', encoding='utf-8') as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=2)
-            
-            # Session state'i güncelle
-            self.index = index
-            self.chunks = np.array(chunks, dtype=object)
-            self.metadata = metadata
-            st.session_state.index_loaded = True
-            st.session_state.chunks_count = len(chunks)
-            
-            st.success(f"✅ Index oluşturuldu: {len(chunks)} parça")
-            return True
-            
-        except Exception as e:
-            st.error(f"Index oluşturma hatası: {e}")
+        with st.spinner("📄 Mevcut PDF işleniyor..."):
+            chunks, page_chunk_map = self.extract_text_from_pdf(self.pdf_path)
+        
+        if not chunks:
             return False
+        
+        return self._add_to_collection(chunks, page_chunk_map, self.pdf_path)
     
     def create_index_from_new_pdf(self, pdf_file):
         """Yeni PDF'den index oluştur"""
         try:
-            with st.spinner("📄 Yeni PDF işleniyor..."):
-                # Geçici dosya oluştur ve kaydet
-                with open(self.pdf_path, 'wb') as f:
-                    f.write(pdf_file.getvalue())
-                
-                # PDF'den metin çıkar
-                doc = fitz.open(self.pdf_path)
-                chunks = []
-                page_chunk_map = []
-                
-                for page_num, page in enumerate(doc, 1):
-                    text = page.get_text().strip()
-                    if text:
-                        # Sayfayı parçalara böl
-                        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-                        for para in paragraphs:
-                            if len(para) > 30:  # Çok kısa paragrafları atla
-                                chunks.append(para)
-                                page_chunk_map.append(page_num)
-                
-                doc.close()
-                
-                if not chunks:
-                    st.error("PDF'den metin çıkarılamadı!")
-                    return False
-                
-                st.info(f"✅ {len(chunks)} metin parçası çıkarıldı")
+            # PDF'i kaydet
+            with open(self.pdf_path, 'wb') as f:
+                f.write(pdf_file.getvalue())
             
+            with st.spinner("📄 Yeni PDF işleniyor..."):
+                chunks, page_chunk_map = self.extract_text_from_pdf(pdf_file=pdf_file)
+            
+            if not chunks:
+                return False
+            
+            return self._add_to_collection(chunks, page_chunk_map, pdf_file.name)
+            
+        except Exception as e:
+            st.error(f"PDF kaydetme hatası: {e}")
+            return False
+    
+    def _add_to_collection(self, chunks, page_chunk_map, source_name):
+        """Koleksiyona parçaları ekle"""
+        try:
             # Embedding oluştur
             with st.spinner("🔨 Embedding'ler oluşturuluyor..."):
-                embeddings = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                embeddings = self.create_embeddings(chunks)
                 
-                for i, chunk in enumerate(chunks):
-                    status_text.text(f"Parça {i+1}/{len(chunks)} işleniyor...")
-                    emb = self._embed_text(chunk)
-                    if emb is not None:
-                        embeddings.append(emb)
-                    
-                    # İlerleme çubuğunu güncelle
-                    progress_bar.progress((i + 1) / len(chunks))
-                
-                status_text.empty()
-                
-                if not embeddings:
-                    st.error("Embedding oluşturulamadı!")
+                if embeddings is None:
                     return False
-                
-                embeddings_array = np.vstack(embeddings)
             
-            # FAISS index oluştur
-            with st.spinner("🏗️ FAISS index oluşturuluyor..."):
-                dim = embeddings_array.shape[1]
-                index = faiss.IndexFlatL2(dim)
-                index.add(embeddings_array)
-                
-                # Kaydet
-                faiss.write_index(index, self.index_path)
-                np.save(self.chunks_path, np.array(chunks, dtype=object))
-                
-                # Metadata kaydet
-                metadata = {
-                    "source": self.pdf_path,
-                    "filename": pdf_file.name,
-                    "chunks_count": len(chunks),
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "page_chunk_map": page_chunk_map
-                }
-                
-                with open(self.metadata_path, 'w', encoding='utf-8') as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=2)
+            # Koleksiyon oluştur veya temizle
+            try:
+                self.chroma_client.delete_collection(self.collection_name)
+            except:
+                pass  # Koleksiyon yoksa sorun değil
             
-            # Session state'i güncelle
-            self.index = index
-            self.chunks = np.array(chunks, dtype=object)
-            self.metadata = metadata
+            self.collection = self.chroma_client.create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            
+            # Batch halinde ekle
+            batch_size = 100
+            for i in range(0, len(chunks), batch_size):
+                end_idx = min(i + batch_size, len(chunks))
+                batch_chunks = chunks[i:end_idx]
+                batch_embeddings = embeddings[i:end_idx]
+                batch_pages = page_chunk_map[i:end_idx]
+                
+                # Metadata hazırla
+                metadatas = [
+                    {
+                        "page": batch_pages[j],
+                        "source": source_name,
+                        "chunk_id": i + j
+                    }
+                    for j in range(len(batch_chunks))
+                ]
+                
+                # ID'ler oluştur
+                ids = [f"chunk_{i+j}" for j in range(len(batch_chunks))]
+                
+                # Koleksiyona ekle
+                self.collection.add(
+                    embeddings=batch_embeddings.tolist(),
+                    documents=batch_chunks,
+                    metadatas=metadatas,
+                    ids=ids
+                )
+            
+            # Metadata kaydet
+            metadata = {
+                "source": source_name,
+                "chunks_count": len(chunks),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "page_chunk_map": page_chunk_map
+            }
+            
+            with open(self.metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            
+            # Session state güncelle
             st.session_state.index_loaded = True
             st.session_state.chunks_count = len(chunks)
+            self.metadata = metadata
             
-            st.success(f"✅ Index oluşturuldu: {len(chunks)} parça")
+            st.success(f"✅ Vector store oluşturuldu: {len(chunks)} parça")
             return True
             
         except Exception as e:
-            st.error(f"Index oluşturma hatası: {e}")
+            st.error(f"Koleksiyona ekleme hatası: {e}")
             return False
     
     def search(self, query, k=5):
-        """Index'te benzer parçaları ara"""
-        if not hasattr(self, 'index') or self.index is None:
+        """Benzer parçaları ara"""
+        if not st.session_state.get('index_loaded', False):
             return []
         
-        # Query embedding
-        query_emb = self._embed_text(query)
-        if query_emb is None:
+        try:
+            # Query embedding
+            query_embedding = self.embedding_model.encode(
+                query,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+            
+            # ChromaDB'de ara
+            results = self.collection.query(
+                query_embeddings=[query_embedding.tolist()],
+                n_results=k,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            # Sonuçları formatla
+            formatted_results = []
+            if results['documents']:
+                for i, doc in enumerate(results['documents'][0]):
+                    distance = results['distances'][0][i]
+                    similarity = 1 - distance  # Cosine benzerliği
+                    
+                    formatted_results.append({
+                        'text': doc,
+                        'distance': float(distance),
+                        'similarity': float(similarity),
+                        'page': results['metadatas'][0][i].get('page', 0),
+                        'chunk_id': results['metadatas'][0][i].get('chunk_id', 0),
+                        'source': results['metadatas'][0][i].get('source', 'Unknown')
+                    })
+            
+            return formatted_results
+            
+        except Exception as e:
+            st.error(f"Arama hatası: {e}")
             return []
-        
-        # Arama
-        distances, indices = self.index.search(query_emb.reshape(1, -1), k)
-        
-        # Sonuçları formatla
-        results = []
-        for i, idx in enumerate(indices[0]):
-            if idx < len(self.chunks):  # Geçerli index kontrolü
-                # Sayfa numarasını bul (varsa)
-                page_num = self.metadata.get("page_chunk_map", [])[idx] if "page_chunk_map" in self.metadata else None
-                
-                results.append({
-                    'text': self.chunks[idx],
-                    'distance': float(distances[0][i]),
-                    'similarity': 1 / (1 + distances[0][i]),  # Benzerlik skoru
-                    'page': page_num,
-                    'chunk_id': int(idx)
-                })
-        
-        return results
     
     def ask_question(self, query, k=5):
         """Soru sor ve yanıt al"""
-        # Index kontrolü
         if not st.session_state.get('index_loaded', False):
             return {
-                "answer": "Lütfen önce bir PDF yükleyin ve index oluşturun.",
+                "answer": "Lütfen önce bir PDF yükleyin ve vector store oluşturun.",
                 "sources": [],
                 "confidence": 0.0
             }
@@ -348,7 +370,7 @@ class StreamlitRAGSystem:
         # Context oluştur
         context_parts = []
         for i, result in enumerate(results):
-            page_info = f" [Sayfa {result['page']}]" if result['page'] else ""
+            page_info = f" [Sayfa {result['page']}]" if result.get('page') else ""
             context_parts.append(f"[Parça {i+1}{page_info}] {result['text']}")
         
         context = "\n\n---\n\n".join(context_parts)
@@ -422,14 +444,14 @@ def main():
             file_size = os.path.getsize("documents/cevre_yasasi.pdf") / 1024 / 1024
             st.success(f"✅ cevre_yasasi.pdf ({file_size:.2f} MB)")
             
-            if st.button("🔄 Mevcut PDF'den Index Oluştur", type="primary"):
+            if st.button("🔄 Mevcut PDF'den Vector Store Oluştur", type="primary", use_container_width=True):
                 if 'rag_system' not in st.session_state:
-                    st.session_state.rag_system = StreamlitRAGSystem()
+                    st.session_state.rag_system = ChromaRAGSystem()
                 
                 rag = st.session_state.rag_system
                 success = rag.create_index_from_existing_pdf()
                 if success:
-                    st.success("✅ Index başarıyla oluşturuldu!")
+                    st.success("✅ Vector store başarıyla oluşturuldu!")
                     time.sleep(2)
                     st.rerun()
         else:
@@ -445,14 +467,14 @@ def main():
         )
         
         if uploaded_file is not None:
-            if st.button("📥 Yeni PDF ile Index Oluştur", type="secondary"):
+            if st.button("📥 Yeni PDF ile Vector Store Oluştur", type="secondary", use_container_width=True):
                 if 'rag_system' not in st.session_state:
-                    st.session_state.rag_system = StreamlitRAGSystem()
+                    st.session_state.rag_system = ChromaRAGSystem()
                 
                 rag = st.session_state.rag_system
                 success = rag.create_index_from_new_pdf(uploaded_file)
                 if success:
-                    st.success("✅ Yeni PDF ile index oluşturuldu!")
+                    st.success("✅ Yeni PDF ile vector store oluşturuldu!")
                     time.sleep(2)
                     st.rerun()
         
@@ -469,34 +491,52 @@ def main():
         st.markdown("---")
         st.subheader("🗄️ Vector Store Durumu")
         
-        # Index durumu
-        index_exists = os.path.exists("vectorstore/index.faiss")
-        chunks_exists = os.path.exists("vectorstore/chunks.npy")
-        
-        if index_exists and chunks_exists:
-            st.success("✅ Index yüklü")
-            try:
-                chunks = np.load("vectorstore/chunks.npy", allow_pickle=True)
-                st.info(f"📊 {len(chunks)} parça")
-                
-                # Metadata göster
-                if os.path.exists("vectorstore/metadata.json"):
+        # Vector store durumu
+        if 'rag_system' in st.session_state and st.session_state.get('index_loaded', False):
+            st.success("✅ Vector store yüklü")
+            chunks_count = st.session_state.get('chunks_count', 0)
+            st.info(f"📊 {chunks_count} parça")
+            
+            # Metadata göster
+            if os.path.exists("vectorstore/metadata.json"):
+                try:
                     with open("vectorstore/metadata.json", 'r', encoding='utf-8') as f:
                         metadata = json.load(f)
                     st.caption(f"Kaynak: {os.path.basename(metadata.get('source', 'Unknown'))}")
                     st.caption(f"Oluşturulma: {metadata.get('created_at', 'Unknown')}")
-            except:
-                st.info("📊 Vector store mevcut")
+                except:
+                    pass
         else:
-            st.warning("⚠️ Index bulunamadı")
+            st.warning("⚠️ Vector store yüklenmedi")
         
         # Temizleme butonu
         st.markdown("---")
-        if st.button("🗑️ Vector Store'u Temizle", type="secondary"):
+        if st.button("🗑️ Vector Store'u Temizle", type="secondary", use_container_width=True):
             try:
-                for file in ["vectorstore/index.faiss", "vectorstore/chunks.npy", "vectorstore/metadata.json"]:
+                # ChromaDB koleksiyonunu sil
+                if 'rag_system' in st.session_state:
+                    try:
+                        st.session_state.rag_system.chroma_client.delete_collection(
+                            st.session_state.rag_system.collection_name
+                        )
+                    except:
+                        pass
+                
+                # Metadata dosyalarını sil
+                for file in ["vectorstore/metadata.json"]:
                     if os.path.exists(file):
                         os.remove(file)
+                
+                # ChromaDB dizinini temizle
+                import shutil
+                if os.path.exists("./chroma_db"):
+                    shutil.rmtree("./chroma_db")
+                
+                # Session state'i sıfırla
+                if 'rag_system' in st.session_state:
+                    del st.session_state.rag_system
+                st.session_state.index_loaded = False
+                
                 st.success("✅ Vector store temizlendi!")
                 time.sleep(2)
                 st.rerun()
@@ -506,7 +546,7 @@ def main():
     # Ana içerik alanı
     # RAG sistemini başlat
     if 'rag_system' not in st.session_state:
-        st.session_state.rag_system = StreamlitRAGSystem()
+        st.session_state.rag_system = ChromaRAGSystem()
     
     rag = st.session_state.rag_system
     
@@ -518,33 +558,33 @@ def main():
         
         with col1:
             st.warning("""
-            ### ⚠️ Vector Store Yüklenemedi
-            
-            **Mevcut Durum:**
-            - PDF: `documents/cevre_yasasi.pdf` - {'✅ Mevcut' if pdf_exists else '❌ Eksik'}
-            - Index: `vectorstore/index.faiss` - {'✅ Mevcut' if index_exists else '❌ Eksik'}
-            - Chunks: `vectorstore/chunks.npy` - {'✅ Mevcut' if chunks_exists else '❌ Eksik'}
+            ### ⚠️ Vector Store Yüklenmedi
             
             **Ne yapabilirsiniz:**
-            1. **Mevcut PDF'den index oluştur** → Sidebar'daki butonu kullanın
+            1. **Mevcut PDF'den vector store oluştur** → Sidebar'daki butonu kullanın
             2. **Yeni PDF yükle** → Sidebar'dan yeni PDF yükleyin
-            3. **Manuel kontrol** → Dosyaların doğru yerde olduğundan emin olun
-            """)
-        
-        with col2:
-            st.info("""
+            
             **📁 Dosya Yapısı:**
             ```
             main/
             ├── documents/
             │   └── cevre_yasasi.pdf
             ├── vectorstore/
-            │   ├── index.faiss
-            │   ├── chunks.npy
             │   └── metadata.json
+            ├── chroma_db/ (otomatik oluşur)
             ├── app.py
             └── requirements.txt
             ```
+            """)
+        
+        with col2:
+            st.info("""
+            **🎯 Özellikler:**
+            - ✅ Python 3.13.9 uyumlu
+            - ✅ FAISS gerekmez
+            - ✅ ChromaDB kullanır
+            - ✅ Local embedding
+            - ✅ Persist storage
             """)
     
     # Soru sorma bölümü
@@ -552,7 +592,7 @@ def main():
     
     query = st.text_area(
         "Çevre hukuku ile ilgili sorunuzu yazın:",
-        placeholder="Örnek: Çevre kirliliği için cezai yaptırımlar nelerdir? Atık yönetimi yükümlülükleri nelerdir? Çevre izinleri nasıl alınır?",
+        placeholder="Örnek: Çevre kirliliği için cezai yaptırımlar nelerdir? Atık yönetimi yükümlülükleri nelerdir?",
         height=100,
         disabled=not index_loaded
     )
@@ -582,9 +622,9 @@ def main():
                 with cols[1]:
                     st.metric("Kullanılan Kaynak", len(result["sources"]))
                 with cols[2]:
-                    avg_page = np.mean([s.get('page', 0) for s in result['sources'] if s.get('page')])
-                    if avg_page > 0:
-                        st.metric("Ort. Sayfa No", f"{avg_page:.0f}")
+                    pages = [s.get('page', 0) for s in result['sources'] if s.get('page', 0) > 0]
+                    if pages:
+                        st.metric("Sayfa No", f"{pages[0]}")
             
             # Kaynakları göster
             if result["sources"]:
@@ -615,14 +655,13 @@ def main():
     with col1:
         st.caption("⚡ Powered by Groq API")
     with col2:
-        st.caption("🔍 FAISS Vector Search")
+        st.caption("🔍 ChromaDB Vector Search")
     with col3:
         st.caption("⚖️ Çevre Hukuku Uzmanı")
 
 if __name__ == "__main__":
     # Environment variables kontrolü
     groq_key = os.getenv("GROQ_API_KEY")
-    hf_token = os.getenv("HF_TOKEN")
     
     if not groq_key:
         st.error("""
@@ -634,28 +673,13 @@ if __name__ == "__main__":
            ```toml
            # .streamlit/secrets.toml
            GROQ_API_KEY = "sk-..."
-           HF_TOKEN = "hf_..."
            ```
         
         2. **Local .env dosyası:**
            ```bash
            # .env dosyası oluşturun
            GROQ_API_KEY=sk-...
-           HF_TOKEN=hf_...
            ```
-        
-        3. **Manuel giriş (geliştirme için):**
         """)
-        
-        # Geliştirme için manuel giriş
-        with st.form("api_keys_form"):
-            groq_input = st.text_input("GROQ API Key:", type="password")
-            hf_input = st.text_input("HuggingFace Token:", type="password")
-            
-            if st.form_submit_button("API Key'leri Kaydet"):
-                os.environ["GROQ_API_KEY"] = groq_input
-                os.environ["HF_TOKEN"] = hf_input
-                st.success("API Key'ler kaydedildi! Sayfayı yenileyin.")
-                st.rerun()
     else:
         main()
