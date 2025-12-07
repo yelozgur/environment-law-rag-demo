@@ -1,11 +1,12 @@
 import faiss
 import os
 from pypdf import PdfReader
-from google.generativeai import configure, GenerativeModel
+import google.generativeai as genai
 import numpy as np
 from tqdm import tqdm
 
-configure(api_key=os.getenv("GEMINI_API_KEY"))
+# API Key yükle
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 def chunk_text(text, chunk_size=800, overlap=100):
@@ -34,29 +35,32 @@ class RAG:
 
         self.index = faiss.read_index(self.index_path)
         self.chunks = np.load(self.meta_path, allow_pickle=True)
-        self.model = GenerativeModel("gemini-1.5-flash")
+        self.llm = genai.GenerativeModel("gemini-1.5-flash")
+
+    def _embed(self, text):
+        result = genai.embed_content(
+            model="text-embedding-004",
+            content=text
+        )
+        return np.array(result["embedding"]).astype("float32")
 
     def _build_index(self):
         reader = PdfReader(self.pdf_path)
         full_text = ""
         for page in reader.pages:
-            full_text += page.extract_text() + "\n"
+            extracted = page.extract_text()
+            if extracted:
+                full_text += extracted + "\n"
 
         chunks = chunk_text(full_text)
 
-        # Embeddings üret
-        model = GenerativeModel("text-embedding-004")
         embeddings = []
         for ch in tqdm(chunks, desc="Embedding oluşturuluyor"):
-            emb = model.embed_content(
-                content=ch,
-                model="text-embedding-004"
-            )["embedding"]
+            emb = self._embed(ch)
             embeddings.append(emb)
 
         embeddings = np.array(embeddings).astype("float32")
 
-        # FAISS index oluştur
         index = faiss.IndexFlatL2(embeddings.shape[1])
         index.add(embeddings)
 
@@ -66,16 +70,15 @@ class RAG:
         print("✔ FAISS index oluşturuldu!")
 
     def ask_lawyer(self, query):
-        model = GenerativeModel("text-embedding-004")
-        q_emb = model.embed_content(content=query)["embedding"]
-        q_emb = np.array(q_emb).astype("float32").reshape(1, -1)
+        q_emb = self._embed(query).reshape(1, -1)
 
         D, I = self.index.search(q_emb, 3)
         retrieved = "\n".join(self.chunks[i] for i in I[0])
 
         prompt = f"""
-Sen Kıbrıs'ın çevre mevzuatında uzman bir hukuk danışmanısın.
-Aşağıdaki mevzuat parçalarına dayanarak profesyonel bir yanıt ver.
+Sen Kıbrıs çevre mevzuatında uzman bir hukuk danışmanısın.
+
+Aşağıdaki mevzuat bölümlerine dayanarak soruyu yanıtla.
 
 Mevzuat:
 {retrieved}
@@ -83,9 +86,8 @@ Mevzuat:
 Soru:
 {query}
 
-Cevap (hukuki, açıklayıcı):
+Cevap:
 """
 
-        lawyer_model = GenerativeModel("gemini-1.5-flash")
-        response = lawyer_model.generate_content(prompt)
-        return response.text
+        answer = self.llm.generate_content(prompt)
+        return answer.text
