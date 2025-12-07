@@ -35,7 +35,7 @@ class RAG:
 
         self.index = faiss.read_index(self.index_path)
         self.chunks = np.load(self.meta_path, allow_pickle=True)
-        self.llm = genai.GenerativeModel("gemini-1.5-flash-001")
+        self.llm = genai.GenerativeModel("gemini-1.5-flash-latest")
 
     def _embed(self, text):
         result = genai.embed_content(
