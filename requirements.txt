@@ -4,4 +4,4 @@ pymupdf>=1.23.0
 requests>=2.31.0
 groq>=0.3.0
 python-dotenv>=1.0.0
-faiss-cpu>=1.7.4
+faiss-cpu==1.7.4
