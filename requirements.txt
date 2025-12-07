@@ -1,6 +1,7 @@
 streamlit
 faiss-cpu
+sentence-transformers
 pypdf
-google-generativeai==0.8.5
+google-genai
 numpy
 pymupdf
